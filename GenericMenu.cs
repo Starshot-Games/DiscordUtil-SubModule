@@ -62,10 +62,16 @@ public class GenericMenu
         });
     }
 
-    public async ValueTask Close()
+    /// <summary>Removes all components and detaches the interaction handler.
+    /// Optionally rewrites the message content/embeds via <paramref name="decorator"/> in the same edit.</summary>
+    public async ValueTask Close(Action<MessageOptions>? decorator = null)
     {
         DeregisterInteractionHandler();
-        await message!.ModifyAsync(edit => edit.WithComponents([]));
+        await message!.ModifyAsync(edit =>
+        {
+            decorator?.Invoke(edit);
+            edit.WithComponents([]);
+        });
     }
 
     public async ValueTask Remove()
@@ -81,7 +87,28 @@ public class GenericMenu
         InternalDecorate(msg);
         msg.WithComponents(GetComponents());
         message = await send.Invoke(msg);
+        StartTimeoutIfAny();
+    }
 
+    /// <summary>Sends the menu as the interaction's initial response. Caller must ensure no other
+    /// response has been sent yet — the slash-command method should NOT also return a string.</summary>
+    internal async ValueTask SendAsInteractionResponse(ApplicationCommandContext context)
+    {
+        MessageProperties tmp = new();
+        decorator.Invoke(tmp);
+        InternalDecorate(tmp);
+
+        InteractionMessageProperties props = new();
+        if (tmp.Content != null) props.Content = tmp.Content;
+        props.Components = GetComponents();
+
+        await context.Interaction.SendResponseAsync(InteractionCallback.Message(props));
+        message = await context.Interaction.GetResponseAsync();
+        StartTimeoutIfAny();
+    }
+
+    void StartTimeoutIfAny()
+    {
         if (timeout is not { } timeoutVal)
             return;
 
@@ -304,9 +331,15 @@ public class GenericMenuBuilder
         menu.RegisterInteractionHandler();
 
         if (context != null)
-            await menu.Send(async msg => await context.Channel.SendMessageAsync(msg));
+        {
+            // Use the slash-command's own interaction response — the menu IS the response
+            // (caller must NOT also return a string from the command method).
+            await menu.SendAsInteractionResponse(context);
+        }
         else
+        {
             await menu.Send(async msg => await rest!.SendMessageAsync(channelId!.Value, msg));
+        }
 
         return menu;
     }
