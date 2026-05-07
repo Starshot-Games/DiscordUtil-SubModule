@@ -82,7 +82,7 @@ public class ResponseListener
         GenericMenu menu = await GenericMenu.Builder(clients.rest, clients.gateway, channelId)
             .Message(message)
             .ActionRow()
-                .Button("Cancel", async _ => listener.Stop(), ButtonStyle.Danger)
+                .Button("Cancel", async (_, _) => listener.Stop(), ButtonStyle.Danger)
             .Build();
         listener.onStop += () =>
         {

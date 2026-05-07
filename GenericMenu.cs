@@ -5,8 +5,8 @@ using NetCord.Services.ApplicationCommands;
 
 namespace JMTech.Shared.NetCord;
 
-public delegate ValueTask ButtonHandler(GenericMenu menu);
-public delegate ValueTask DropdownHandler(GenericMenu menu, IReadOnlyList<string> selected);
+public delegate ValueTask ButtonHandler(GenericMenu menu, ButtonInteraction interaction);
+public delegate ValueTask DropdownHandler(GenericMenu menu, IReadOnlyList<string> selected, StringMenuInteraction interaction);
 
 // ---- Runtime menu ---------------------------------------------------------
 
@@ -22,6 +22,9 @@ public class GenericMenu
     readonly Dictionary<int, IReadOnlyList<string>> dropdownSelections = new();
 
     RestMessage? message;
+
+    /// <summary>Discord message ID of the menu's message, once it's been sent. Null until Build() completes.</summary>
+    public ulong? MessageId => message?.Id;
 
     internal GenericMenu(Guid id, Action<MessageProperties> decorator, Row[] rows, GatewayClient gateway, int? timeout)
     {
@@ -138,7 +141,7 @@ public class GenericMenu
         if (pos < 0 || pos >= row.Buttons.Length) return;
 
         await button.SendResponseAsync(InteractionCallback.DeferredModifyMessage);
-        await row.Buttons[pos].onClick.Invoke(this);
+        await row.Buttons[pos].onClick.Invoke(this, button);
     }
 
     async ValueTask HandleDropdown(StringMenuInteraction stringMenu)
@@ -156,7 +159,7 @@ public class GenericMenu
         await stringMenu.SendResponseAsync(InteractionCallback.DeferredModifyMessage);
 
         if (row.Dropdown.onSelect != null)
-            await row.Dropdown.onSelect.Invoke(this, selected);
+            await row.Dropdown.onSelect.Invoke(this, selected, stringMenu);
     }
 
     static bool TryParseId(string customId, out string guid, out string idPart)
