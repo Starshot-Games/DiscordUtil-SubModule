@@ -202,6 +202,50 @@ public class GenericMenu
         return components;
     }
 
+    // ---- Static entry points ------------------------------------------
+
+    /// <summary>Start a new builder for a slash-command-driven menu.</summary>
+    public static GenericMenuBuilder Builder(ApplicationCommandContext context) => new(context);
+
+    /// <summary>Start a new builder targeting a specific channel via the REST/Gateway clients.</summary>
+    public static GenericMenuBuilder Builder(RestClient rest, GatewayClient gateway, ulong channelId) => new(rest, gateway, channelId);
+
+    /// <summary>Yes/No confirmation menu — convenience over the builder for the common case.</summary>
+    public static Task<GenericMenu> OpenConfirm(
+        ApplicationCommandContext context,
+        string message,
+        ButtonHandler onYes,
+        ButtonHandler onNo,
+        string yesText = "Yes",
+        string noText = "No",
+        int? timeout = null)
+    {
+        GenericMenuBuilder b = Builder(context).Message(message);
+        if (timeout.HasValue) b.Timeout(timeout.Value);
+        return b.ActionRow()
+            .Button(yesText, onYes, ButtonStyle.Success)
+            .Button(noText, onNo, ButtonStyle.Danger)
+            .Build();
+    }
+
+    /// <summary>Yes/No confirmation menu posted into the given channel.</summary>
+    public static Task<GenericMenu> OpenConfirm(
+        RestClient rest, GatewayClient gateway, ulong channelId,
+        string message,
+        ButtonHandler onYes,
+        ButtonHandler onNo,
+        string yesText = "Yes",
+        string noText = "No",
+        int? timeout = null)
+    {
+        GenericMenuBuilder b = Builder(rest, gateway, channelId).Message(message);
+        if (timeout.HasValue) b.Timeout(timeout.Value);
+        return b.ActionRow()
+            .Button(yesText, onYes, ButtonStyle.Success)
+            .Button(noText, onNo, ButtonStyle.Danger)
+            .Build();
+    }
+
     // ---- Internal row spec types --------------------------------------
     internal abstract class Row { }
     internal class ButtonRow : Row { public required Button[] Buttons; }

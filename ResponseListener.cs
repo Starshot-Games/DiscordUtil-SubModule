@@ -79,7 +79,7 @@ public class ResponseListener
     public static async Task<ResponseListener> Manual(NetCordClients clients, ulong channelId, string message, OnResponse onResponse, MessageFilter? filter = null)
     {
         ResponseListener listener = new(clients.gateway, onResponse, filter);
-        GenericMenu menu = await new GenericMenuBuilder(clients.rest, clients.gateway, channelId)
+        GenericMenu menu = await GenericMenu.Builder(clients.rest, clients.gateway, channelId)
             .Message(message)
             .ActionRow()
                 .Button("Cancel", async _ => listener.Stop(), ButtonStyle.Danger)
