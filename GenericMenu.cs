@@ -8,39 +8,49 @@ namespace JMTech.Shared.NetCord;
 public delegate ValueTask ButtonHandler(GenericMenu menu);
 public delegate ValueTask DropdownHandler(GenericMenu menu, IReadOnlyList<string> selected);
 
+// ---- Runtime menu ---------------------------------------------------------
+
 public class GenericMenu
 {
     readonly Guid id;
     readonly Action<MessageProperties> decorator;
-    readonly Dropdown[] dropdowns;
-    readonly Button[] buttons;
+    readonly Row[] rows;
     readonly GatewayClient gateway;
     readonly int? timeout;
 
-    // Latest selected values per dropdown (by index). Updated on each
-    // StringMenuInteraction so button handlers can read the current selection
-    // server-side without round-tripping through the message.
+    // Latest selection per dropdown row (keyed by row index — only dropdown rows ever appear here).
     readonly Dictionary<int, IReadOnlyList<string>> dropdownSelections = new();
 
     RestMessage? message;
 
-    protected GenericMenu(Guid id, Action<MessageProperties> decorator, Dropdown[] dropdowns, Button[] buttons, GatewayClient gateway, int? timeout)
+    internal GenericMenu(Guid id, Action<MessageProperties> decorator, Row[] rows, GatewayClient gateway, int? timeout)
     {
         this.id = id;
         this.decorator = decorator;
-        this.dropdowns = dropdowns;
-        this.buttons = buttons;
+        this.rows = rows;
         this.gateway = gateway;
         this.timeout = timeout;
     }
 
-    /// <summary>Latest selection values for the dropdown at <paramref name="dropdownIndex"/>; empty if no selection yet.</summary>
-    public IReadOnlyList<string> GetSelected(int dropdownIndex) =>
-        dropdownSelections.TryGetValue(dropdownIndex, out IReadOnlyList<string>? v) ? v : Array.Empty<string>();
+    /// <summary>Latest values selected on the Nth dropdown (0-based across dropdowns, in row order). Empty if no selection yet.</summary>
+    public IReadOnlyList<string> GetSelected(int dropdownIndex)
+    {
+        int found = -1;
+        for (int r = 0; r < rows.Length; r++)
+        {
+            if (rows[r] is not DropdownRow) continue;
+            if (++found == dropdownIndex)
+                return dropdownSelections.TryGetValue(r, out IReadOnlyList<string>? v) ? v : Array.Empty<string>();
+        }
+        return Array.Empty<string>();
+    }
 
-    /// <summary>First selected value for the dropdown, or null if no selection yet.</summary>
-    public string? GetSelectedSingle(int dropdownIndex) =>
-        GetSelected(dropdownIndex).Count > 0 ? GetSelected(dropdownIndex)[0] : null;
+    /// <summary>First selected value for the Nth dropdown, or null.</summary>
+    public string? GetSelectedSingle(int dropdownIndex)
+    {
+        IReadOnlyList<string> sel = GetSelected(dropdownIndex);
+        return sel.Count > 0 ? sel[0] : null;
+    }
 
     public async ValueTask UpdateMessage(Action<MessageOptions> decorator)
     {
@@ -51,26 +61,20 @@ public class GenericMenu
             InternalDecorate(edit);
         });
     }
+
     public async ValueTask Close()
     {
         DeregisterInteractionHandler();
         await message!.ModifyAsync(edit => edit.WithComponents([]));
     }
+
     public async ValueTask Remove()
     {
         DeregisterInteractionHandler();
         await message!.DeleteAsync();
     }
 
-    async ValueTask SendInitialMessage(ulong channelId, RestClient client)
-    {
-        await SendInitialMessage(async msg => await client.SendMessageAsync(channelId, msg));
-    }
-    async ValueTask SendInitialMessage(TextChannel channel)
-    {
-        await SendInitialMessage(async msg => await channel.SendMessageAsync(msg));
-    }
-    async ValueTask SendInitialMessage(Func<MessageProperties, ValueTask<RestMessage>> send)
+    internal async ValueTask Send(Func<MessageProperties, ValueTask<RestMessage>> send)
     {
         MessageProperties msg = new();
         decorator.Invoke(msg);
@@ -81,15 +85,15 @@ public class GenericMenu
         if (timeout is not { } timeoutVal)
             return;
 
-        _ = Task.Run(TimeoutRunner);
-        async Task TimeoutRunner()
+        _ = Task.Run(async () =>
         {
-            Console.WriteLine($"Running timeout timer for {id.ToString()}");
             await Task.Delay(timeoutVal * 1000);
-            Console.WriteLine($"Timeout on {id.ToString()}");
             await Close();
-        }
+        });
     }
+
+    internal void RegisterInteractionHandler() => gateway.InteractionCreate += OnInteractionCreate;
+    void DeregisterInteractionHandler() => gateway.InteractionCreate -= OnInteractionCreate;
 
     void InternalDecorate(MessageProperties msg)
     {
@@ -102,71 +106,56 @@ public class GenericMenu
             msg.Content += $"\n\n*(Menu expires in {timeout}s)*";
     }
 
-    void RegisterInteractionHandler() => gateway.InteractionCreate += OnInteractionCreate;
-    void DeregisterInteractionHandler() => gateway.InteractionCreate -= OnInteractionCreate;
-
+    // Custom-id scheme:
+    //   button:   "{guid}/{rowIdx}.{positionInRow}"
+    //   dropdown: "{guid}/{rowIdx}"   (no dot)
     async ValueTask OnInteractionCreate(Interaction interaction)
     {
-        // Custom-id scheme:
-        //   buttons:   "{guid}/{index}"
-        //   dropdowns: "{guid}/d{index}"   (the 'd' prefix differentiates them)
         switch (interaction)
         {
-            case ButtonInteraction button:
-                await HandleButton(button);
-                break;
-            case StringMenuInteraction stringMenu:
-                await HandleDropdown(stringMenu);
-                break;
+            case ButtonInteraction button: await HandleButton(button); break;
+            case StringMenuInteraction stringMenu: await HandleDropdown(stringMenu); break;
         }
     }
 
     async ValueTask HandleButton(ButtonInteraction button)
     {
-        Console.WriteLine($"Menu button interaction!\n" +
-                          $"cId = {button.Data.CustomId}\n" +
-                          $"menuId = {this.id.ToString()}");
+        if (!TryParseId(button.Data.CustomId, out string ownerGuid, out string idPart) || ownerGuid != id.ToString())
+            return;
 
-        if (!TryParseCustomId(button.Data.CustomId, out string ownerGuid, out string idPart))
-            return;
-        if (ownerGuid != this.id.ToString())
-            return;
-        if (!int.TryParse(idPart, out int btnIdx) || btnIdx < 0 || btnIdx >= buttons.Length)
-            return;
+        int dot = idPart.IndexOf('.');
+        if (dot < 0) return;
+        if (!int.TryParse(idPart.AsSpan(0, dot), out int rowIdx)) return;
+        if (!int.TryParse(idPart.AsSpan(dot + 1), out int pos)) return;
+        if (rowIdx < 0 || rowIdx >= rows.Length) return;
+        if (rows[rowIdx] is not ButtonRow row) return;
+        if (pos < 0 || pos >= row.Buttons.Length) return;
 
         await button.SendResponseAsync(InteractionCallback.DeferredModifyMessage);
-        await buttons[btnIdx].onClick.Invoke(this);
+        await row.Buttons[pos].onClick.Invoke(this);
     }
 
     async ValueTask HandleDropdown(StringMenuInteraction stringMenu)
     {
-        Console.WriteLine($"Menu dropdown interaction!\n" +
-                          $"cId = {stringMenu.Data.CustomId}\n" +
-                          $"menuId = {this.id.ToString()}");
-
-        if (!TryParseCustomId(stringMenu.Data.CustomId, out string ownerGuid, out string idPart))
+        if (!TryParseId(stringMenu.Data.CustomId, out string ownerGuid, out string idPart) || ownerGuid != id.ToString())
             return;
-        if (ownerGuid != this.id.ToString())
-            return;
-        if (idPart.Length < 2 || idPart[0] != 'd')
-            return;
-        if (!int.TryParse(idPart.AsSpan(1), out int ddIdx) || ddIdx < 0 || ddIdx >= dropdowns.Length)
-            return;
+        if (idPart.Contains('.')) return; // button shape, ignore
+        if (!int.TryParse(idPart, out int rowIdx)) return;
+        if (rowIdx < 0 || rowIdx >= rows.Length) return;
+        if (rows[rowIdx] is not DropdownRow row) return;
 
         IReadOnlyList<string> selected = stringMenu.Data.SelectedValues;
-        dropdownSelections[ddIdx] = selected;
+        dropdownSelections[rowIdx] = selected;
 
         await stringMenu.SendResponseAsync(InteractionCallback.DeferredModifyMessage);
 
-        DropdownHandler? handler = dropdowns[ddIdx].onSelect;
-        if (handler != null)
-            await handler.Invoke(this, selected);
+        if (row.Dropdown.onSelect != null)
+            await row.Dropdown.onSelect.Invoke(this, selected);
     }
 
-    static bool TryParseCustomId(string customId, out string guid, out string idPart)
+    static bool TryParseId(string customId, out string guid, out string idPart)
     {
-        guid = "";
-        idPart = "";
+        guid = ""; idPart = "";
         int slash = customId.IndexOf('/');
         if (slash < 0) return false;
         guid = customId.Substring(0, slash);
@@ -178,97 +167,183 @@ public class GenericMenu
     {
         List<IMessageComponentProperties> components = [];
 
-        // String-select menus are top-level components (NetCord serializes them into
-        // their own ActionRow as Discord requires). Don't wrap manually.
-        for (int i = 0; i < dropdowns.Length; i++)
+        for (int r = 0; r < rows.Length; r++)
         {
-            Dropdown d = dropdowns[i];
-            StringMenuSelectOptionProperties[] opts = new StringMenuSelectOptionProperties[d.options.Length];
-            for (int o = 0; o < d.options.Length; o++)
+            switch (rows[r])
             {
-                DropdownOption opt = d.options[o];
-                opts[o] = new StringMenuSelectOptionProperties(opt.label, opt.value);
-                if (opt.description != null)
-                    opts[o].Description = opt.description;
+                case ButtonRow buttonRow:
+                    ActionRowProperties row = [];
+                    for (int p = 0; p < buttonRow.Buttons.Length; p++)
+                    {
+                        Button b = buttonRow.Buttons[p];
+                        row.Add(new ButtonProperties($"{id}/{r}.{p}", b.label, b.style).WithDisabled(b.disabled));
+                    }
+                    components.Add(row);
+                    break;
+
+                case DropdownRow dropdownRow:
+                    Dropdown d = dropdownRow.Dropdown;
+                    StringMenuSelectOptionProperties[] opts = new StringMenuSelectOptionProperties[d.options.Length];
+                    for (int o = 0; o < d.options.Length; o++)
+                    {
+                        DropdownOption opt = d.options[o];
+                        opts[o] = new StringMenuSelectOptionProperties(opt.label, opt.value);
+                        if (opt.description != null) opts[o].Description = opt.description;
+                    }
+                    StringMenuProperties menu = new StringMenuProperties($"{id}/{r}", opts)
+                        .WithPlaceholder(d.placeholder)
+                        .WithMinValues(d.minValues)
+                        .WithMaxValues(d.maxValues);
+                    components.Add(menu);
+                    break;
             }
-
-            StringMenuProperties menu = new StringMenuProperties($"{id}/d{i}", opts)
-                .WithPlaceholder(d.placeholder)
-                .WithMinValues(d.minValues)
-                .WithMaxValues(d.maxValues);
-
-            components.Add(menu);
-        }
-
-        // Buttons need explicit ActionRow wrapping, packed into rows of 5.
-        for (int row = 0; row < buttons.Length; row += 5)
-        {
-            ActionRowProperties actionRow = [];
-            components.Add(actionRow);
-
-            for (int b = row; b < row + 5 && b < buttons.Length; b++)
-                actionRow.Add(new ButtonProperties($"{id}/{b}", buttons[b].label, buttons[b].style).WithDisabled(buttons[b].disabled));
         }
 
         return components;
     }
 
-    // ---- Open factories ---------------------------------------------------
-    // Existing button-only signatures (unchanged callsites).
-    public static Task<GenericMenu> Open(ApplicationCommandContext context, Action<MessageProperties> decorator, params Button[] buttons)
-        => OpenInternal(decorator, [], buttons, context.Client, null, m => m.SendInitialMessage(context.Channel));
-    public static Task<GenericMenu> Open(RestClient rest, GatewayClient gateway, ulong channelId, Action<MessageProperties> decorator, params Button[] buttons)
-        => OpenInternal(decorator, [], buttons, gateway, null, m => m.SendInitialMessage(channelId, rest));
-    public static Task<GenericMenu> Open(ApplicationCommandContext context, Action<MessageProperties> decorator, int? timeout, params Button[] buttons)
-        => OpenInternal(decorator, [], buttons, context.Client, timeout, m => m.SendInitialMessage(context.Channel));
-    public static Task<GenericMenu> Open(RestClient rest, GatewayClient gateway, ulong channelId, Action<MessageProperties> decorator, int? timeout, params Button[] buttons)
-        => OpenInternal(decorator, [], buttons, gateway, timeout, m => m.SendInitialMessage(channelId, rest));
+    // ---- Internal row spec types --------------------------------------
+    internal abstract class Row { }
+    internal class ButtonRow : Row { public required Button[] Buttons; }
+    internal class DropdownRow : Row { public required Dropdown Dropdown; }
+}
 
-    // New: dropdowns + buttons. The `int? timeout` slot is required (pass null for
-    // no timeout) so this overload is unambiguous against the button-only ones.
-    public static Task<GenericMenu> Open(ApplicationCommandContext context, Action<MessageProperties> decorator, int? timeout, Dropdown[] dropdowns, params Button[] buttons)
-        => OpenInternal(decorator, dropdowns, buttons, context.Client, timeout, m => m.SendInitialMessage(context.Channel));
-    public static Task<GenericMenu> Open(RestClient rest, GatewayClient gateway, ulong channelId, Action<MessageProperties> decorator, int? timeout, Dropdown[] dropdowns, params Button[] buttons)
-        => OpenInternal(decorator, dropdowns, buttons, gateway, timeout, m => m.SendInitialMessage(channelId, rest));
+// ---- Builders -------------------------------------------------------------
 
-    static async Task<GenericMenu> OpenInternal(
-        Action<MessageProperties> decorator,
-        Dropdown[] dropdowns,
-        Button[] buttons,
-        GatewayClient gateway,
-        int? timeout,
-        Func<GenericMenu, ValueTask> send)
+public class GenericMenuBuilder
+{
+    readonly ApplicationCommandContext? context;
+    readonly RestClient? rest;
+    readonly GatewayClient gateway;
+    readonly ulong? channelId;
+
+    Action<MessageProperties> decorator = _ => { };
+    int? timeout;
+    readonly List<GenericMenu.Row> rows = new();
+
+    public GenericMenuBuilder(ApplicationCommandContext context)
     {
+        this.context = context;
+        this.gateway = context.Client;
+    }
+
+    public GenericMenuBuilder(RestClient rest, GatewayClient gateway, ulong channelId)
+    {
+        this.rest = rest;
+        this.gateway = gateway;
+        this.channelId = channelId;
+    }
+
+    public GenericMenuBuilder Message(string text)
+    {
+        decorator = msg => msg.WithContent(text);
+        return this;
+    }
+
+    public GenericMenuBuilder Message(Action<MessageProperties> apply)
+    {
+        decorator = apply;
+        return this;
+    }
+
+    public GenericMenuBuilder Timeout(int seconds) { timeout = seconds; return this; }
+
+    public ActionRowBuilder ActionRow() => new(this);
+
+    public async Task<GenericMenu> Build()
+    {
+        if (rows.Count == 0)
+            throw new InvalidOperationException("GenericMenuBuilder.Build called with no action rows.");
+
         Guid id = Guid.NewGuid();
-        GenericMenu menu = new(id, decorator, dropdowns, buttons, gateway, timeout);
+        GenericMenu menu = new(id, decorator, rows.ToArray(), gateway, timeout);
         menu.RegisterInteractionHandler();
-        await send.Invoke(menu);
+
+        if (context != null)
+            await menu.Send(async msg => await context.Channel.SendMessageAsync(msg));
+        else
+            await menu.Send(async msg => await rest!.SendMessageAsync(channelId!.Value, msg));
+
         return menu;
     }
 
-    public static Task<GenericMenu> OpenConfirm(ApplicationCommandContext context,
-                                                Action<MessageProperties> decorator,
-                                                ButtonHandler onYes,
-                                                ButtonHandler onNo,
-                                                string yesText = "Yes",
-                                                string noText = "No",
-                                                int? timeout = null)
-    {
-        return Open(context, decorator, timeout, new Button(ButtonStyle.Success, yesText, onYes), new Button(ButtonStyle.Danger, noText, onNo));
-    }
-    public static Task<GenericMenu> OpenConfirm(RestClient rest,
-                                                GatewayClient gateway,
-                                                ulong channelId,
-                                                Action<MessageProperties> decorator,
-                                                ButtonHandler onYes,
-                                                ButtonHandler onNo,
-                                                string yesText = "Yes",
-                                                string noText = "No",
-                                                int? timeout = null)
-    {
-        return Open(rest, gateway, channelId, decorator, timeout, new Button(ButtonStyle.Success, yesText, onYes), new Button(ButtonStyle.Danger, noText, onNo));
-    }
+    internal void AddRow(GenericMenu.Row row) => rows.Add(row);
 }
+
+public class ActionRowBuilder
+{
+    readonly GenericMenuBuilder parent;
+    readonly List<Button> buttons = new();
+    Dropdown? dropdown;
+
+    internal ActionRowBuilder(GenericMenuBuilder parent) { this.parent = parent; }
+
+    // ---- Buttons --------------------------------------------------------
+
+    public ActionRowBuilder Button(string label, ButtonHandler onClick, ButtonStyle style = ButtonStyle.Primary, bool disabled = false)
+        => Button(new Button(style, label, onClick, disabled));
+
+    public ActionRowBuilder Button(Button button)
+    {
+        if (dropdown.HasValue) throw new InvalidOperationException("ActionRow already has a dropdown — buttons can't be mixed in.");
+        if (buttons.Count >= 5) throw new InvalidOperationException("ActionRow can hold at most 5 buttons.");
+        buttons.Add(button);
+        return this;
+    }
+
+    public ActionRowBuilder Buttons(params Button[] btns) => Buttons((IEnumerable<Button>)btns);
+
+    public ActionRowBuilder Buttons(IEnumerable<Button> btns)
+    {
+        foreach (Button b in btns) Button(b);
+        return this;
+    }
+
+    // ---- Dropdown -------------------------------------------------------
+
+    public ActionRowBuilder Dropdown(string placeholder, params DropdownOption[] options)
+        => Dropdown(new Dropdown(placeholder, options));
+
+    public ActionRowBuilder Dropdown(string placeholder, IEnumerable<DropdownOption> options)
+        => Dropdown(new Dropdown(placeholder, options.ToArray()));
+
+    public ActionRowBuilder Dropdown(Dropdown d)
+    {
+        if (buttons.Count > 0) throw new InvalidOperationException("ActionRow already has buttons — a dropdown can't be added.");
+        if (dropdown.HasValue) throw new InvalidOperationException("ActionRow already has a dropdown.");
+        dropdown = d;
+        return this;
+    }
+
+    /// <summary>Attach a select-changed handler to the dropdown that was just added in this row.</summary>
+    public ActionRowBuilder OnSelect(DropdownHandler handler)
+    {
+        if (!dropdown.HasValue) throw new InvalidOperationException("Add a Dropdown before OnSelect.");
+        Dropdown d = dropdown.Value;
+        dropdown = new Dropdown(d.placeholder, d.options, handler, d.minValues, d.maxValues);
+        return this;
+    }
+
+    /// <summary>Finishes this row and returns to the menu builder.</summary>
+    public GenericMenuBuilder Close()
+    {
+        if (dropdown.HasValue)
+            parent.AddRow(new GenericMenu.DropdownRow { Dropdown = dropdown.Value });
+        else if (buttons.Count > 0)
+            parent.AddRow(new GenericMenu.ButtonRow { Buttons = buttons.ToArray() });
+        else
+            throw new InvalidOperationException("ActionRow is empty — add at least one button or a dropdown before closing.");
+        return parent;
+    }
+
+    /// <summary>Closes this row and starts a new one (shortcut for Close().ActionRow()).</summary>
+    public ActionRowBuilder ActionRow() => Close().ActionRow();
+
+    /// <summary>Closes this row and builds the menu (shortcut for Close().Build()).</summary>
+    public Task<GenericMenu> Build() => Close().Build();
+}
+
+// ---- Component value types ------------------------------------------------
 
 public struct Button(ButtonStyle style, string label, ButtonHandler onClick, bool disabled = false)
 {
