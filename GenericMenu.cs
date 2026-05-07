@@ -87,28 +87,7 @@ public class GenericMenu
         InternalDecorate(msg);
         msg.WithComponents(GetComponents());
         message = await send.Invoke(msg);
-        StartTimeoutIfAny();
-    }
 
-    /// <summary>Sends the menu as the interaction's initial response. Caller must ensure no other
-    /// response has been sent yet — the slash-command method should NOT also return a string.</summary>
-    internal async ValueTask SendAsInteractionResponse(ApplicationCommandContext context)
-    {
-        MessageProperties tmp = new();
-        decorator.Invoke(tmp);
-        InternalDecorate(tmp);
-
-        InteractionMessageProperties props = new();
-        if (tmp.Content != null) props.Content = tmp.Content;
-        props.Components = GetComponents();
-
-        await context.Interaction.SendResponseAsync(InteractionCallback.Message(props));
-        message = await context.Interaction.GetResponseAsync();
-        StartTimeoutIfAny();
-    }
-
-    void StartTimeoutIfAny()
-    {
         if (timeout is not { } timeoutVal)
             return;
 
@@ -331,15 +310,9 @@ public class GenericMenuBuilder
         menu.RegisterInteractionHandler();
 
         if (context != null)
-        {
-            // Use the slash-command's own interaction response — the menu IS the response
-            // (caller must NOT also return a string from the command method).
-            await menu.SendAsInteractionResponse(context);
-        }
+            await menu.Send(async msg => await context.Channel.SendMessageAsync(msg));
         else
-        {
             await menu.Send(async msg => await rest!.SendMessageAsync(channelId!.Value, msg));
-        }
 
         return menu;
     }
